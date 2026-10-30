@@ -19,7 +19,7 @@ for name in ("/etc/wingman/token", "/etc/wingman/vnc",
              "/etc/ssl/private/ssl-cert-snakeoil.key", "/home/box/.claude.json",
              "/home/box/.claude/.credentials.json", "/home/box/.config/gh/hosts.yml"):
     assert not Path(name).exists(), "unexpected credential file in the image"
-pattern = re.compile(rb"(?:ghp_|gho_|github_pat_|sk-ant-|xai-)[A-Za-z0-9_]{10,}|BEGIN [A-Z ]*PRIVATE KEY")
+pattern = re.compile(rb"(?:gh[po]_|github[_]pat_|sk[-]ant-|xai-)[A-Za-z0-9_]{10,}|BEGIN [A-Z ]*PRIVATE KEY")
 for root in ("/etc", "/home", "/opt", "/root", "/usr/local"):
     for path in Path(root).rglob("*"):
         if path.is_file() and not path.is_symlink():
