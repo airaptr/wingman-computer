@@ -1,7 +1,7 @@
 # Merging this reviewed lock selects the image new computers will boot.
 image=ghcr.io/airaptr/wingman-computer
-digest=sha256:fa28b0cc15ed0840e4dfb4d64452f3fbf9e05ec9ed5f8278151cbbe4fe96e258
+digest=sha256:228a2c8a44dd6dcee126a59ad3b2290d0263172a69035cf247d70d7f04ea8597
 tag=2026.10.30
-source_commit=9db54bdaf1c2d296e18bf56ef598fa67cfab4853
-built=2026-10-30T06:40:25Z
-workflow_run=https://github.com/airaptr/wingman-computer/actions/runs/41015060384
+source_commit=9a14ebb24ce9700c96ba821fa1266efca53333d4
+built=2026-10-30T07:24:19Z
+workflow_run=https://github.com/airaptr/wingman-computer/actions/runs/41019519896
