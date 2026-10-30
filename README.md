@@ -12,6 +12,10 @@ but GHCR still refuses anonymous downloads (HTTP 401). The package needs its Pub
 setting enabled before the download instructions work without a registry login. Local builds work
 without that switch.
 
+The organization also blocks Actions from opening PRs. CI writes the verified lock branch, but its
+proposal job stops at that policy. The initial [lock PR](https://github.com/airaptr/wingman-computer/pull/6)
+was operator-opened and must pass both read-only boot gates before merging.
+
 ## Run on this Mac
 
 Install Apple's `container` CLI on macOS 26 or newer, then:
@@ -195,17 +199,19 @@ image can be traced back to the exact source and boot gates.
 
 ## Measured
 
-First release measurements, 2026-10-30, source `45957d5e2916ac65460deb64140a302ee9835f22`:
+Release measurements, 2026-10-30, source `9db54bdaf1c2d296e18bf56ef598fa67cfab4853`:
 
 | Native architecture | Regression tests | Live desktop, browser, HTTP, PTY and credential gates | Tested OCI archive artifact |
 | --- | --- | --- | --- |
-| Linux arm64 | 31 passed | Passed | 1,125,868,860 bytes |
+| Linux arm64 | 31 passed | Passed | 1,125,867,324 bytes |
 | Linux amd64 | 31 passed | Passed | 1,146,481,468 bytes |
 
-[The release run](https://github.com/airaptr/wingman-computer/actions/runs/41011471336) records both
-boot gates and successful registry-provenance verification. Artifact byte counts include archive
-packaging; they are not expanded disk use. Both builds passed the separate compressed-layer budget
-of less than 1.5 GiB.
+The build and publication jobs in
+[the release run](https://github.com/airaptr/wingman-computer/actions/runs/41015060384) passed both
+boot gates and verified the registry-stored provenance bundle against the exact source SHA and ref.
+The proposal job is blocked by the organization policy above, so the overall workflow is not green.
+Artifact byte counts include archive packaging; they are not expanded disk use. Both builds passed
+the separate compressed-layer budget of less than 1.5 GiB.
 
 The updated launcher also passed all 31 source tests and the live desktop checks on macOS. Screenshot
 checks read the actual 1920x1200 RGB screen and dock, not a placeholder. Public cold-download and
