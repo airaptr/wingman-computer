@@ -7,6 +7,11 @@ The public source is [airaptr/wingman-computer](https://github.com/airaptr/wingm
 `image.lock` selects an exact multi-architecture image, not a moving tag. Each release is built and
 boot-tested on native Linux arm64 and amd64 runners before publication, with registry provenance.
 
+**Release access, 2026-10-30:** both images are published and their provenance was verified in CI,
+but GHCR still refuses anonymous downloads (HTTP 401). The package needs its Public visibility
+setting enabled before the download instructions work without a registry login. Local builds work
+without that switch.
+
 ## Run on this Mac
 
 Install Apple's `container` CLI on macOS 26 or newer, then:
@@ -168,6 +173,12 @@ The repository or organization must allow GitHub Actions to create pull requests
 must be Public for anonymous downloads; repository access inheritance alone is not proof of this.
 Neither requirement is bypassed with a stored personal token.
 
+For anonymous downloads, open the organization's
+[package settings](https://github.com/orgs/airaptr/packages/container/package/wingman-computer/settings).
+Under **Danger Zone**, click **Change visibility**, select **Public**, and confirm. The source-repo
+label is already present before publication. GitHub inherits repository access permissions, not
+package visibility; linking a public repository alone does not make the image public.
+
 Local regression checks (standard library only):
 
 ```sh
@@ -181,10 +192,21 @@ image can be traced back to the exact source and boot gates.
 
 ## Measured
 
-The local source baseline passed 25 regression tests on macOS on 2026-10-29. The desktop contract is
-1920x1200 RGB; CI checks the real composed screenshot, including the dock, rather than a placeholder.
-Every native build must have less than 1.5 GiB of compressed image layers. Release sizes and
-download/boot timings are reported only after measuring the published digest.
+First release measurements, 2026-10-30, source `45957d5e2916ac65460deb64140a302ee9835f22`:
+
+| Native architecture | Regression tests | Live desktop, browser, HTTP, PTY and credential gates | Tested OCI archive artifact |
+| --- | --- | --- | --- |
+| Linux arm64 | 31 passed | Passed | 1,125,868,860 bytes |
+| Linux amd64 | 31 passed | Passed | 1,146,481,468 bytes |
+
+[The release run](https://github.com/airaptr/wingman-computer/actions/runs/41011471336) records both
+boot gates and successful registry-provenance verification. Artifact byte counts include archive
+packaging; they are not expanded disk use. Both builds passed the separate compressed-layer budget
+of less than 1.5 GiB.
+
+The updated launcher also passed all 31 source tests and the live desktop checks on macOS. Screenshot
+checks read the actual 1920x1200 RGB screen and dock, not a placeholder. Public cold-download and
+cached-restart timings are not claimed while anonymous registry access is blocked.
 
 ## License
 
