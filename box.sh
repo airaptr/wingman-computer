@@ -69,11 +69,11 @@ image_ref() {
 have_image() { "$RT" image inspect "$1" >/dev/null 2>&1; }
 
 image_digest() {
-    if [ "$RT" = container ]; then
+    if [[ "$1" == *@sha256:* ]]; then
+        printf '%s\n' "${1##*@}"
+    elif [ "$RT" = container ]; then
         container image inspect "$1" | python3 -c \
             'import json,sys; print(json.load(sys.stdin)[0]["configuration"]["descriptor"]["digest"])'
-    elif [[ "$1" == *@sha256:* ]]; then
-        printf '%s\n' "${1##*@}"
     else
         "$RT" image inspect "$1" | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["Id"])'
     fi
@@ -86,8 +86,18 @@ pull() {
     local free
     free=$(df -Pk "$HERE" | awk 'END {print $4}')
     [ "$free" -ge 4194304 ] || die "The image needs more free disk space; free at least 4 GiB and try again."
-    "$RT" image pull "$ref"
-    have_image "$ref" || die "The image download did not finish; check your connection and try again."
+    local attempt
+    for attempt in 1 2 3; do
+        if "$RT" image pull "$ref"; then
+            have_image "$ref" || die "The image download did not finish; check your connection and try again."
+            return
+        fi
+        if [ "$attempt" -lt 3 ]; then
+            printf 'The image download failed; retrying (%s/3).\n' "$attempt" >&2
+            sleep "$((attempt * 2))"
+        fi
+    done
+    die "The image download failed after three attempts; check your connection and try again."
 }
 
 ensure_secrets() {
@@ -151,7 +161,11 @@ running_image() {
 }
 
 running_digest() {
-    if [ "$RT" = container ]; then
+    local ref
+    ref=$(running_image)
+    if [[ "$ref" == *@sha256:* ]]; then
+        printf '%s\n' "${ref##*@}"
+    elif [ "$RT" = container ]; then
         container inspect "$NAME" | python3 -c \
             'import json,sys; print(json.load(sys.stdin)[0]["configuration"]["image"]["descriptor"]["digest"])'
     else

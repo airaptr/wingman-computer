@@ -23,7 +23,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     DISPLAY=:1
 
 # Desktop, apps, fonts and tools. Chromium on both architectures (Google Chrome has no arm64 Linux build).
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get -o Acquire::Retries=5 update && apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
         xvfb x11vnc novnc websockify xauth x11-utils x11-xserver-utils x11-apps \
         xfwm4 xfce4-panel xfce4-terminal thunar plank picom hsetroot \
         dbus dbus-x11 dbus-user-session at-spi2-core dconf-cli desktop-file-utils xdg-utils \

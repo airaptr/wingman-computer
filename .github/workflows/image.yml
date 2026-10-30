@@ -52,6 +52,7 @@ jobs:
           outputs: type=oci,dest=${{ runner.temp }}/image.tar
           provenance: false
           sbom: false
+          labels: org.opencontainers.image.revision=${{ github.sha }}
           pull: true
           no-cache: ${{ github.event_name == 'schedule' }}
           cache-from: type=gha,scope=desktop-${{ matrix.arch }}
@@ -83,7 +84,7 @@ jobs:
   publish:
     name: Publish only after both native boot gates
     needs: build
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -139,12 +140,21 @@ jobs:
           subject-name: ${{ env.IMAGE }}
           subject-digest: ${{ steps.index.outputs.digest }}
           push-to-registry: true
+      - name: Verify the registry provenance before proposing a lock
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DIGEST: ${{ steps.index.outputs.digest }}
+        run: |
+          gh attestation verify "oci://$IMAGE@$DIGEST" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/image.yml"
 
   lock:
     name: Propose the verified image lock
     needs: publish
     runs-on: ubuntu-24.04
     permissions:
+      actions: write
       contents: write
       pull-requests: write
     steps:
@@ -167,6 +177,7 @@ jobs:
             echo "workflow_run=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           } > image.lock
       - name: Open a bot PR; never write directly to main
+        id: pr
         uses: peter-evans/create-pull-request@22a9089034f40e5a961c8808d113e2c98fb63676 # v7
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -179,3 +190,8 @@ jobs:
             The published multi-architecture index has a GitHub build-provenance attestation.
             Review and merge this PR to select the digest; no moving tag is used by box.sh.
           delete-branch: true
+      - name: Run read-only boot checks for the bot PR
+        if: steps.pr.outputs.pull-request-number != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run image.yml --repo "$GITHUB_REPOSITORY" --ref bot/image-lock
