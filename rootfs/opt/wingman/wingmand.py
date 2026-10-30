@@ -16,9 +16,12 @@ import fcntl
 import hashlib
 import hmac
 import http.server
+import ipaddress
 import json
+import math
 import os
 import pty
+import pwd
 import select
 import signal
 import socket
@@ -29,7 +32,6 @@ import termios
 import threading
 import time
 import urllib.parse
-import zlib
 
 BIND = os.environ.get("WINGMAN_BIND", "127.0.0.1")
 EXEC_PORT = int(os.environ.get("WINGMAN_EXEC_PORT", "1337"))
@@ -43,11 +45,9 @@ MAX_TIMEOUT = 3600
 VERSION = "1"
 
 # The parts of the desktop the health report checks: name -> process name in /proc/<pid>/comm.
-PROCESSES = {
-    "display": "Xvfb", "window_manager": "xfwm4", "panel": "xfce4-panel", "dock": "plank",
-    "compositor": "picom", "vnc": "x11vnc",
-}
-PORTS = {"vnc": 5900, "novnc": 6080, "novnc_view": 6081, "exec": EXEC_PORT, "pty": PTY_PORT}
+PROCESSES = {"Xvfb", "xfwm4", "xfce4-panel", "plank", "picom", "x11vnc", "websockify"}
+PORTS = {"vnc": 5900, "vnc_view": 5901, "novnc": 6080, "novnc_view": 6081,
+         "exec": EXEC_PORT, "pty": PTY_PORT}
 
 STARTED = time.time()
 
@@ -82,11 +82,45 @@ def bearer(header):
     return None
 
 
+def loopback_authority(authority):
+    """Parse a Host authority without DNS, userinfo, paths or ambiguous ports."""
+    if not authority or any(c in authority for c in "/\\@?# \t\r\n"):
+        return None
+    try:
+        parsed = urllib.parse.urlsplit("//" + authority)
+        hostname, port = parsed.hostname, parsed.port
+        if not hostname or (port is not None and not 1 <= port <= 65535):
+            return None
+        if hostname.lower() not in ("localhost", "localhost."):
+            if not ipaddress.ip_address(hostname).is_loopback:
+                return None
+        return hostname.lower(), port or 80
+    except ValueError:
+        return None
+
+
+def request_guard(host, origin):
+    authority = loopback_authority(host)
+    if authority is None:
+        return 421, "a loopback Host is required"
+    if origin is not None:
+        try:
+            parsed = urllib.parse.urlsplit(origin)
+            valid = (parsed.scheme == "http" and not parsed.path and not parsed.query
+                     and not parsed.fragment and loopback_authority(parsed.netloc) == authority)
+        except ValueError:
+            valid = False
+        if not valid:
+            return 403, "a same-origin loopback client is required"
+    return None
+
+
 def child_env():
     env = {
         "HOME": "/home/box", "USER": "box", "LOGNAME": "box", "SHELL": "/bin/bash",
         "PATH": "/home/box/.local/bin:/usr/local/bin:/usr/bin:/bin",
-        "LANG": os.environ.get("LANG", "C.UTF-8"), "TZ": os.environ.get("TZ", "America/Los_Angeles"),
+        "LANG": os.environ.get("LANG", "C.UTF-8"), "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
+        "TZ": os.environ.get("TZ", "America/Los_Angeles"),
         "DISPLAY": DISPLAY, "XDG_RUNTIME_DIR": os.environ.get("XDG_RUNTIME_DIR", "/run/user/1000"),
         "DBUS_SESSION_BUS_ADDRESS": os.environ.get("DBUS_SESSION_BUS_ADDRESS", ""),
         "XDG_CURRENT_DESKTOP": "XFCE", "TERM": "xterm-256color",
@@ -137,18 +171,21 @@ def screen_size():
 def health():
     comms = running_comms()
     ports = listening_ports()
-    procs = {k: (v in comms) for k, v in PROCESSES.items()}
     listen = {k: (v in ports) for k, v in PORTS.items()}
     size = screen_size()
-    required = [procs["display"], procs["window_manager"], procs["panel"], procs["dock"],
-                listen["vnc"], listen["novnc"], size is not None]
+    required = [PROCESSES <= comms, all(listen.values()), size == "1920x1200"]
     return {
         "ok": all(required),
         "version": VERSION,
         "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "uptime_s": round(time.time() - STARTED, 1),
         "screen": size,
-        "processes": procs,
+        "tz": os.environ.get("TZ", "America/Los_Angeles"),
+        "locale": os.environ.get("LANG", "C.UTF-8"),
+        "user": pwd.getpwuid(os.getuid()).pw_name,
+        "uid": os.getuid(),
+        "processes": sorted(comms),
+        "image_digest": os.environ.get("WINGMAN_IMAGE_DIGEST", ""),
         "listening": listen,
     }
 
@@ -161,7 +198,7 @@ def health_writer():
             with open(tmp, "wb") as f:
                 f.write(data)
             os.replace(tmp, HEALTH_FILE)
-        except Exception as e:  # keep writing even if one round fails
+        except (OSError, ValueError, subprocess.SubprocessError) as e:
             log(f"health: {type(e).__name__}")
         time.sleep(5)
 
@@ -169,37 +206,9 @@ def health_writer():
 # ---------------------------------------------------------------- screenshot
 
 def screenshot_png():
-    """Grab the root window with xwd and turn its ZPixmap into a PNG, without extra libraries."""
-    raw = subprocess.run(["xwd", "-root", "-silent", "-display", DISPLAY],
-                         capture_output=True, timeout=20, check=True).stdout
-    hdr = struct.unpack(">25I", raw[:100])
-    header_size, fmt, depth, width, height = hdr[0], hdr[2], hdr[3], hdr[4], hdr[5]
-    byte_order, bpp, bpl, ncolors = hdr[7], hdr[11], hdr[12], hdr[19]
-    # Xvfb at depth 24 hands xwd packed 3-byte pixels (bits_per_pixel 24); other servers use 4.
-    if fmt != 2 or bpp not in (24, 32):
-        raise ValueError(f"unsupported xwd format {fmt}/{bpp}")
-    step = bpp // 8
-    if bpl < width * step:
-        raise ValueError("xwd line too short")
-    data = raw[header_size + ncolors * 12:]
-    rows = []
-    for y in range(height):
-        line = data[y * bpl: y * bpl + width * step]
-        if byte_order == 0:          # LSB first: B G R [X]
-            b, g, r = line[0::step], line[1::step], line[2::step]
-        else:                        # MSB first: [X] R G B
-            o = step - 3
-            r, g, b = line[o::step], line[o + 1::step], line[o + 2::step]
-        px = bytearray(width * 3)
-        px[0::3], px[1::3], px[2::3] = r, g, b
-        rows.append(b"\x00" + bytes(px))
-
-    def chunk(kind, body):
-        c = kind + body
-        return struct.pack(">I", len(body)) + c + struct.pack(">I", zlib.crc32(c) & 0xFFFFFFFF)
-
-    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
-            + chunk(b"IDAT", zlib.compress(b"".join(rows), 6)) + chunk(b"IEND", b""))
+    """Keep Xlib's fatal display errors inside a short-lived capture process."""
+    return subprocess.run(["python3", "-I", "/opt/wingman/screenshot.py", DISPLAY],
+                          capture_output=True, timeout=20, check=True).stdout
 
 
 # ---------------------------------------------------------------- exec (1337)
@@ -213,20 +222,29 @@ def run_command(req):
         argv = ["/bin/bash", "-lc", req["cmd"]]
     else:
         raise ValueError("send cmd (a string) or argv (a list)")
-    cwd = req.get("cwd") or "/home/box"
-    timeout = min(float(req.get("timeout", 120)), MAX_TIMEOUT)
+    cwd = req.get("cwd", "/home/box")
+    timeout = float(req.get("timeout", 120))
+    if not math.isfinite(timeout) or timeout <= 0 or timeout > MAX_TIMEOUT:
+        raise ValueError(f"timeout must be between 0 and {MAX_TIMEOUT} seconds")
+    if not isinstance(cwd, str):
+        raise ValueError("cwd must be a path string")
     env = child_env()
-    extra = req.get("env") or {}
-    if not isinstance(extra, dict):
-        raise ValueError("env must be an object")
-    env.update({str(k): str(v) for k, v in extra.items()})
+    extra = req.get("env", {})
+    if not isinstance(extra, dict) or not all(isinstance(k, str) and isinstance(v, str)
+                                            for k, v in extra.items()):
+        raise ValueError("env must map strings to strings")
+    env.update(extra)
 
+    stdin = req.get("stdin")
+    if stdin is not None and not isinstance(stdin, str):
+        raise ValueError("stdin must be a string")
+    if "detach" in req and not isinstance(req["detach"], bool):
+        raise ValueError("detach must be a boolean")
     if req.get("detach"):  # for windows and other long runners: setsid -f leaves no child behind
         rc = subprocess.run(["setsid", "-f"] + argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10).returncode
         return {"detached": True, "exit_code": rc}
 
-    stdin = req.get("stdin")
     t0 = time.time()
     p = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE, start_new_session=True)
@@ -235,6 +253,7 @@ def run_command(req):
         out, err = p.communicate(stdin.encode() if isinstance(stdin, str) else None, timeout=timeout)
     except subprocess.TimeoutExpired:
         timed_out = True
+        # owner-checked: this process group was created by Popen(start_new_session=True) above.
         os.killpg(p.pid, signal.SIGKILL)
         out, err = p.communicate()
     return {
@@ -252,7 +271,7 @@ class ExecHandler(http.server.BaseHTTPRequestHandler):
     sys_version = ""
 
     def log_message(self, fmt, *args):  # one short line, never headers or bodies
-        log(f"exec {self.command} {urllib.parse.urlsplit(self.path).path} -> {args[1] if len(args) > 1 else ''}")
+        log("exec request completed")
 
     def send_json(self, code, obj, extra=None):
         body = json.dumps(obj).encode()
@@ -263,13 +282,25 @@ class ExecHandler(http.server.BaseHTTPRequestHandler):
         for k, v in (extra or {}).items():
             self.send_header(k, v)
         self.end_headers()
-        self.wfile.write(body)
+        if self.command != "HEAD":
+            self.wfile.write(body)
 
     def authorized(self):
-        if token_ok(bearer(self.headers.get("Authorization"))):
-            return True
-        self.send_json(401, {"error": "a valid box token is required"}, {"WWW-Authenticate": "Bearer"})
-        return False
+        if len(self.headers.get_all("Authorization", [])) != 1 or not token_ok(
+                bearer(self.headers.get("Authorization"))):
+            self.send_json(401, {"error": "a valid box token is required"}, {"WWW-Authenticate": "Bearer"})
+            return False
+        if len(self.headers.get_all("Host", [])) != 1:
+            self.send_json(421, {"error": "one loopback Host is required"})
+            return False
+        if len(self.headers.get_all("Origin", [])) > 1:
+            self.send_json(403, {"error": "one same-origin client is required"})
+            return False
+        refused = request_guard(self.headers.get("Host"), self.headers.get("Origin"))
+        if refused:
+            self.send_json(refused[0], {"error": refused[1]})
+            return False
+        return True
 
     def do_GET(self):
         if not self.authorized():
@@ -281,7 +312,7 @@ class ExecHandler(http.server.BaseHTTPRequestHandler):
         elif path == "/screenshot":
             try:
                 png = screenshot_png()
-            except Exception as e:
+            except (OSError, ValueError, struct.error, subprocess.SubprocessError) as e:
                 return self.send_json(500, {"error": f"screenshot failed: {type(e).__name__}"})
             self.send_response(200)
             self.send_header("Content-Type", "image/png")
@@ -310,8 +341,14 @@ class ExecHandler(http.server.BaseHTTPRequestHandler):
             self.send_json(200, run_command(req))
         except (ValueError, TypeError, OSError) as e:
             self.send_json(400, {"error": str(e)})
+        except subprocess.SubprocessError:
+            self.send_json(500, {"error": "the command could not be started"})
 
-    do_PUT = do_DELETE = do_PATCH = lambda self: self.send_json(405, {"error": "method not allowed"})
+    def unsupported_method(self):
+        if self.authorized():
+            self.send_json(405, {"error": "method not allowed"})
+
+    do_PUT = do_DELETE = do_PATCH = do_HEAD = do_OPTIONS = unsupported_method
 
 
 class Server(http.server.ThreadingHTTPServer):
@@ -345,7 +382,7 @@ def recv_exact(sock, n):
     return buf
 
 
-def ws_recv(sock):
+def ws_recv(sock, control=None):
     """Read one whole message. Returns (opcode, payload). Client frames must be masked."""
     message, first_op = b"", None
     while True:
@@ -355,12 +392,24 @@ def ws_recv(sock):
             n = struct.unpack(">H", recv_exact(sock, 2))[0]
         elif n == 127:
             n = struct.unpack(">Q", recv_exact(sock, 8))[0]
-        if not masked or n > MAX_BODY:
+        if b1 & 0x70 or not masked or n > MAX_BODY or len(message) + n > MAX_BODY:
             raise ConnectionError("bad frame")
         mask = recv_exact(sock, 4)
         data = bytes(c ^ mask[i % 4] for i, c in enumerate(recv_exact(sock, n)))
         if op >= 8:                       # control frames come whole, between fragments
+            if not fin or n > 125 or op not in (8, 9, 10):
+                raise ConnectionError("bad control frame")
+            if op == 9:
+                if control:
+                    control(10, data)
+                else:
+                    ws_send(sock, 10, data)
+                continue
+            if op == 10:
+                continue
             return op, data
+        if op not in (0, 1, 2) or (first_op is None and op == 0) or (first_op is not None and op != 0):
+            raise ConnectionError("bad continuation")
         if first_op is None:
             first_op = op
         message += data
@@ -375,7 +424,7 @@ class PtyHandler(socketserver.BaseRequestHandler):
         try:
             raw = b""
             while b"\r\n\r\n" not in raw:
-                chunk = sock.recv(4096)
+                chunk = sock.recv(1)
                 if not chunk or len(raw) > 16384:
                     return
                 raw += chunk
@@ -387,10 +436,13 @@ class PtyHandler(socketserver.BaseRequestHandler):
         except ValueError:
             return
         headers = {}
+        duplicate = False
         for line in head[1:]:
             if ":" in line:
                 k, v = line.split(":", 1)
-                headers[k.strip().lower()] = v.strip()
+                name = k.strip().lower()
+                duplicate |= name in headers
+                headers[name] = v.strip()
 
         def refuse(code, reason):
             sock.sendall(f"HTTP/1.1 {code} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".encode())
@@ -401,11 +453,28 @@ class PtyHandler(socketserver.BaseRequestHandler):
         if not token_ok(presented):
             log("pty refused: no valid token")
             return refuse(401, "Unauthorized")
+        if duplicate:
+            return refuse(400, "Bad Request")
+        refused = request_guard(headers.get("host"), headers.get("origin"))
+        if refused:
+            return refuse(refused[0], "Misdirected Request" if refused[0] == 421 else "Forbidden")
         url = urllib.parse.urlsplit(target)
         if method != "GET" or url.path != "/pty":
             return refuse(404, "Not Found")
         key = headers.get("sec-websocket-key")
-        if headers.get("upgrade", "").lower() != "websocket" or not key:
+        try:
+            valid_key = key is not None and len(base64.b64decode(key, validate=True)) == 16
+        except ValueError:
+            valid_key = False
+        if (headers.get("upgrade", "").lower() != "websocket" or not valid_key
+                or "upgrade" not in {p.strip().lower() for p in headers.get("connection", "").split(",")}
+                or headers.get("sec-websocket-version") != "13"):
+            return refuse(400, "Bad Request")
+        q = urllib.parse.parse_qs(url.query)
+        try:
+            cols = int(q.get("cols", ["120"])[0])
+            rows = int(q.get("rows", ["32"])[0])
+        except ValueError:
             return refuse(400, "Bad Request")
         accept = base64.b64encode(hashlib.sha1(key.encode() + WS_GUID).digest()).decode()
         reply = ("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
@@ -415,8 +484,6 @@ class PtyHandler(socketserver.BaseRequestHandler):
         sock.sendall((reply + "\r\n").encode())
         sock.settimeout(None)
 
-        q = urllib.parse.parse_qs(url.query)
-        cols = int(q.get("cols", ["120"])[0]); rows = int(q.get("rows", ["32"])[0])
         pid, fd = pty.fork()
         if pid == 0:
             try:
@@ -427,6 +494,11 @@ class PtyHandler(socketserver.BaseRequestHandler):
         log(f"pty open pid {pid}")
         self.resize(fd, cols, rows)
         stop = threading.Event()
+        send_lock = threading.Lock()
+
+        def send(opcode, payload):
+            with send_lock:
+                ws_send(sock, opcode, payload)
 
         def pump_out():
             try:
@@ -436,12 +508,16 @@ class PtyHandler(socketserver.BaseRequestHandler):
                         data = os.read(fd, 65536)
                         if not data:
                             break
-                        ws_send(sock, 2, data)
+                        send(2, data)
             except OSError:
                 pass
             stop.set()
             try:
-                ws_send(sock, 8, struct.pack(">H", 1000))
+                send(8, struct.pack(">H", 1000))
+            except OSError:
+                pass
+            try:
+                sock.shutdown(socket.SHUT_RD)
             except OSError:
                 pass
 
@@ -449,11 +525,11 @@ class PtyHandler(socketserver.BaseRequestHandler):
         t.start()
         try:
             while not stop.is_set():
-                op, data = ws_recv(sock)
+                op, data = ws_recv(sock, send)
                 if op == 8:
                     break
                 if op == 9:
-                    ws_send(sock, 10, data)
+                    send(10, data)
                 elif op == 2:
                     os.write(fd, data)
                 elif op == 1:
@@ -463,6 +539,8 @@ class PtyHandler(socketserver.BaseRequestHandler):
                             self.resize(fd, int(msg["cols"]), int(msg["rows"]))
                         elif isinstance(msg, dict) and isinstance(msg.get("input"), str):
                             os.write(fd, msg["input"].encode())
+                        else:
+                            os.write(fd, data)
                     except (ValueError, TypeError):
                         os.write(fd, data)
         except (ConnectionError, OSError):
@@ -470,13 +548,21 @@ class PtyHandler(socketserver.BaseRequestHandler):
         finally:
             stop.set()
             try:
+                # owner-checked: pid is the child returned by this connection's pty.fork().
                 os.kill(pid, signal.SIGHUP)
             except OSError:
                 pass
             t.join(2)
             try:
                 os.close(fd)
-                os.waitpid(pid, 0)
+                for _ in range(20):
+                    if os.waitpid(pid, os.WNOHANG)[0]:
+                        break
+                    time.sleep(0.1)
+                else:
+                    # owner-checked: only this connection's unreaped pty.fork() child is terminated.
+                    os.kill(pid, signal.SIGKILL)
+                    os.waitpid(pid, 0)
             except OSError:
                 pass
             log(f"pty closed pid {pid}")

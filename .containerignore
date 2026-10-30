@@ -1,0 +1,17 @@
+.git
+.github
+__pycache__
+**/__pycache__
+*.pyc
+**/*.pyc
+*.tar
+**/*.tar
+*.tar.*
+**/*.tar.*
+*.png
+.env
+.env.*
+tests
+tools/*
+!tools/image-hygiene.py
+image.oci

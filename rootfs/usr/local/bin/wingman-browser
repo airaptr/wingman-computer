@@ -1,3 +1,6 @@
 #!/bin/sh
-# The box browser: Chromium with the settings in /etc/chromium.d/wingman.
-exec /usr/bin/chromium "$@"
+# CDP stays inside the box; the desktop profile lives on the home volume.
+exec /usr/bin/chromium \
+    --user-data-dir="$HOME/chrome-profile" \
+    --remote-debugging-address=127.0.0.1 \
+    --remote-debugging-port=9222 "$@"

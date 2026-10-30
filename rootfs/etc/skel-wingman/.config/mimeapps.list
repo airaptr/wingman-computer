@@ -1,5 +1,5 @@
 [Default Applications]
-text/html=chromium.desktop
-x-scheme-handler/http=chromium.desktop
-x-scheme-handler/https=chromium.desktop
+text/html=wingman-browser.desktop
+x-scheme-handler/http=wingman-browser.desktop
+x-scheme-handler/https=wingman-browser.desktop
 inode/directory=thunar.desktop

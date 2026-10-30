@@ -37,15 +37,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl wget ca-certificates gnupg sudo procps psmisc iproute2 acl bubblewrap tzdata less \
     && { apt-get purge -y light-locker xfce4-screensaver xfce4-power-manager 2>/dev/null || true; } \
     && ln -sf /usr/share/zoneinfo/America/Los_Angeles /etc/localtime && echo America/Los_Angeles > /etc/timezone \
-    && rm -rf /var/lib/apt/lists/*
+    && find /var/lib/apt/lists -mindepth 1 -delete
 
 # GitHub CLI from GitHub's signed apt repository. Sign-in happens later, by the user, inside the box.
 RUN install -d -m 0755 /etc/apt/keyrings \
-    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 20 \
+         https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
     && chmod 0644 /etc/apt/keyrings/githubcli-archive-keyring.gpg \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list \
-    && apt-get update && apt-get install -y --no-install-recommends gh \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get -o Acquire::Retries=5 update && apt-get -o Acquire::Retries=5 install -y --no-install-recommends gh \
+    && find /var/lib/apt/lists -mindepth 1 -delete
 
 # Node.js 24 and uv, from their official release files, checked against pinned SHA-256 sums.
 RUN set -eu; \
@@ -55,32 +56,46 @@ RUN set -eu; \
       *) echo "unsupported arch $TARGETARCH" >&2; exit 1 ;; \
     esac; \
     cd /tmp; \
-    curl -fsSLo node.tar.xz "https://nodejs.org/dist/v$NODE_VERSION/node-v$NODE_VERSION-linux-$n.tar.xz"; \
+    curl -fsSLo node.tar.xz --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 20 \
+        "https://nodejs.org/dist/v$NODE_VERSION/node-v$NODE_VERSION-linux-$n.tar.xz"; \
     echo "$ns  node.tar.xz" | sha256sum -c -; \
     tar -xJf node.tar.xz -C /usr/local --strip-components=1 --no-same-owner; \
-    curl -fsSLo uv.tar.gz "https://github.com/astral-sh/uv/releases/download/$UV_VERSION/uv-$u-unknown-linux-gnu.tar.gz"; \
+    curl -fsSLo uv.tar.gz --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 20 \
+        "https://github.com/astral-sh/uv/releases/download/$UV_VERSION/uv-$u-unknown-linux-gnu.tar.gz"; \
     echo "$us  uv.tar.gz" | sha256sum -c -; \
     tar -xzf uv.tar.gz --strip-components=1 -C /usr/local/bin --no-same-owner; \
     rm -f node.tar.xz uv.tar.gz; \
-    rm -f /usr/local/CHANGELOG.md /usr/local/README.md /usr/local/LICENSE; \
+    rm -f /usr/local/CHANGELOG.md /usr/local/README.md; \
     node --version; npm --version; uv --version
 
+# Keep source and desktop edits after the slow package/download layers.
+COPY tools/image-hygiene.py /tmp/wingman-image-hygiene.py
+RUN python3 /tmp/wingman-image-hygiene.py \
+    && rm -f /tmp/wingman-image-hygiene.py \
+    && if dpkg-query -W -f='${db:Status-Status}' ssl-cert 2>/dev/null | grep -qx installed; then \
+         apt-get purge -y ssl-cert; \
+       fi \
+    && test ! -e /etc/ssl/private/ssl-cert-snakeoil.key \
+    && npm config get registry >/dev/null
+
 # The one user. Home is a volume, so the skeleton is kept aside and copied in when the volume is empty.
+COPY LICENSE NOTICE /usr/share/doc/wingman-computer/
 COPY rootfs/ /
 RUN useradd -m -u 1000 -s /bin/bash box \
     && echo 'box ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/box && chmod 0440 /etc/sudoers.d/box \
     && cp -a /etc/skel-wingman/. /home/box/ \
     && mkdir -p /home/box/agent-data /home/box/wingman-data /home/box/chrome-profile \
-                /home/box/out /home/box/reference /home/box/cli-config /home/box/.claude \
+                /home/box/out /home/box/reference \
     && chown -R box:box /home/box \
     && cp -a /home/box /opt/box-skel \
-    && chmod 0755 /opt/wingman/*.sh /opt/wingman/wingmand.py /usr/local/bin/wingman-browser \
-    && dconf update && python3 -m py_compile /opt/wingman/wingmand.py
+    && chmod 0755 /opt/wingman/*.sh /opt/wingman/*.py /usr/local/bin/wingman-browser \
+    && dconf update && update-desktop-database \
+    && python3 -c 'from pathlib import Path; [compile(p.read_text(), str(p), "exec") for p in Path("/opt/wingman").glob("*.py")]'
 
-# 1920x1200 at depth 24 with 4-byte pixels (+32), so transparent windows composite cleanly.
-ENV BOX_GEOMETRY=1920x1200x24+32
+# Xvfb provides both the depth-24 root and depth-32 ARGB visuals.
+ENV BOX_GEOMETRY=1920x1200x24
 
 # 6080 noVNC (control), 6081 noVNC (view only), 1337 exec, 1338 pty.
 # The services listen on 127.0.0.1 unless WINGMAN_BIND says otherwise; every one needs the box token.
 EXPOSE 6080 6081 1337 1338
-ENTRYPOINT ["/opt/wingman/entrypoint.sh"]
+ENTRYPOINT ["python3", "-I", "/opt/wingman/cpu-session.py", "/opt/wingman/entrypoint.sh"]

@@ -1,19 +1,20 @@
 name: image
 
-# Builds the Wingman Computer for linux/arm64 and linux/amd64 on native runners, boots each one and
-# checks /health, then joins them into one multi-arch image on GHCR, attests its provenance and pins
-# the new digest in image.lock.
 on:
   push:
     branches: [main]
-    paths-ignore: ["image.lock", "**.md", "LICENSE"]
+    paths-ignore: [image.lock, "**.md", LICENSE, NOTICE]
+  pull_request:
+    paths-ignore: ["**.md", LICENSE, NOTICE]
   workflow_dispatch:
+  schedule:
+    - cron: "17 9 * * 1"
 
 permissions:
   contents: read
 
 concurrency:
-  group: image
+  group: image-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: false
 
 env:
@@ -21,117 +22,160 @@ env:
 
 jobs:
   build:
+    name: Boot gate (${{ matrix.arch }})
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
         include:
-          - { arch: amd64, runner: ubuntu-24.04 }
-          - { arch: arm64, runner: ubuntu-24.04-arm }
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
-    permissions:
-      contents: read
-      packages: write
-    outputs:
-      digest-amd64: ${{ steps.out.outputs.digest-amd64 }}
-      digest-arm64: ${{ steps.out.outputs.digest-arm64 }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - id: build
-        uses: docker/build-push-action@v6
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Install the OCI archive transport
+        run: |
+          if ! command -v skopeo >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends skopeo
+          fi
+      - name: Build once, without registry access
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: Containerfile
           platforms: linux/${{ matrix.arch }}
-          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          outputs: type=oci,dest=${{ runner.temp }}/image.tar
           provenance: false
           sbom: false
-      - id: out
-        run: echo "digest-${{ matrix.arch }}=${{ steps.build.outputs.digest }}" >> "$GITHUB_OUTPUT"
-      - name: Smoke test, boot the image and ask /health
+          pull: true
+          no-cache: ${{ github.event_name == 'schedule' }}
+          cache-from: type=gha,scope=desktop-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=desktop-${{ matrix.arch }}
+      - name: Load the exact archive and enforce the size budget
         env:
-          REF: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          ARCHIVE: ${{ runner.temp }}/image.tar
         run: |
           set -euo pipefail
-          docker pull "$REF"
-          docker run -d --name box --shm-size 1g -e WINGMAN_BIND=0.0.0.0 -p 127.0.0.1:1337:1337 "$REF"
-          code=000
-          for i in $(seq 90); do
-            code=$(docker exec box sh -c 'curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $(cat /etc/wingman/token)" http://127.0.0.1:1337/health' || true)
-            [ "$code" = 200 ] && break
-            sleep 2
-          done
-          echo "health after ${i} tries: $code"
-          # The token never leaves the box: the check runs inside it, and only the report is printed.
-          docker exec box sh -c 'curl -s -H "Authorization: Bearer $(cat /etc/wingman/token)" http://127.0.0.1:1337/health' | tee health.json
-          echo
-          noauth=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:1337/health)
-          echo "health without a token from the runner: $noauth"
-          test "$noauth" = 401
-          python3 -c 'import json,sys; h=json.load(open("health.json")); assert h["ok"], h; assert h["screen"]=="1920x1200", h["screen"]'
-          docker exec box sh -c 'node --version; uv --version; gh --version | head -1; chromium --version; python3 --version; date +%Z'
-      - if: failure()
-        run: docker exec box sh -c 'tail -n 40 /var/log/wingman/*.log' || true
+          skopeo inspect --raw "oci-archive:$ARCHIVE" | jq -e '([.layers[].size] | add) < 1610612736'
+          skopeo inspect --format '{{.Digest}}' "oci-archive:$ARCHIVE" > "$RUNNER_TEMP/digest.txt"
+          skopeo copy "oci-archive:$ARCHIVE" docker-daemon:wingman-computer:dev
+      - name: Check image hygiene, desktop, browser, authentication and PTY
+        env:
+          WINGMAN_RUNTIME: docker
+          WINGMAN_COMPUTER_IMAGE: wingman-computer:dev
+        run: bash tools/ci-check.sh
+      - name: Retain only the tested OCI bytes
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: desktop-${{ matrix.arch }}
+          path: |
+            ${{ runner.temp }}/image.tar
+            ${{ runner.temp }}/digest.txt
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
 
   publish:
+    name: Publish only after both native boot gates
     needs: build
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     permissions:
-      contents: write
+      contents: read
       packages: write
       id-token: write
       attestations: write
+    outputs:
+      digest: ${{ steps.index.outputs.digest }}
+      tag: ${{ steps.index.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: desktop-*
+          path: images
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - id: merge
-        env:
-          A: ${{ needs.build.outputs.digest-amd64 }}
-          B: ${{ needs.build.outputs.digest-arm64 }}
+      - name: Push the tested archives by digest, without rebuilding
         run: |
           set -euo pipefail
-          day=$(TZ=America/Los_Angeles date +%Y.%m.%d)
-          docker buildx imagetools create -t "$IMAGE:$day" -t "$IMAGE:latest" "$IMAGE@$A" "$IMAGE@$B"
-          digest=$(docker buildx imagetools inspect "$IMAGE:$day" --format '{{json .Manifest}}' | jq -r .digest)
+          if ! command -v skopeo >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends skopeo
+          fi
+          for arch in amd64 arm64; do
+            archive="images/desktop-$arch/image.tar"
+            expected=$(cat "images/desktop-$arch/digest.txt")
+            actual=$(skopeo inspect --format '{{.Digest}}' "oci-archive:$archive")
+            test "$actual" = "$expected"
+            skopeo copy --preserve-digests --authfile "$HOME/.docker/config.json" \
+              "oci-archive:$archive" "docker://$IMAGE@$expected"
+          done
+      - name: Join both architectures into the release index
+        id: index
+        run: |
+          set -euo pipefail
+          amd64=$(cat images/desktop-amd64/digest.txt)
+          arm64=$(cat images/desktop-arm64/digest.txt)
+          tag=$(date -u +%Y.%m.%d)
+          docker buildx imagetools create -t "$IMAGE:$tag" -t "$IMAGE:latest" \
+            "$IMAGE@$amd64" "$IMAGE@$arm64"
+          digest=$(docker buildx imagetools inspect "$IMAGE:$tag" --format '{{json .Manifest}}' | jq -r .digest)
+          docker buildx imagetools inspect --raw "$IMAGE@$digest" | \
+            jq -e '[.manifests[].platform.architecture] | sort == ["amd64","arm64"]'
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
-          echo "tag=$day" >> "$GITHUB_OUTPUT"
-          docker buildx imagetools inspect "$IMAGE@$digest"
-      - uses: actions/attest-build-provenance@v2
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - name: Attest the multi-architecture index
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-name: ${{ env.IMAGE }}
-          subject-digest: ${{ steps.merge.outputs.digest }}
+          subject-digest: ${{ steps.index.outputs.digest }}
           push-to-registry: true
-      - name: Pin the new digest in image.lock
+
+  lock:
+    name: Propose the verified image lock
+    needs: publish
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Write the proposed lock
         env:
-          DIGEST: ${{ steps.merge.outputs.digest }}
-          TAG: ${{ steps.merge.outputs.tag }}
+          DIGEST: ${{ needs.publish.outputs.digest }}
+          TAG: ${{ needs.publish.outputs.tag }}
         run: |
           set -euo pipefail
-          cat > image.lock <<EOF
-          # The Wingman Computer image this repo pins. box.sh pull and start use this digest, never a moving tag.
-          image=$IMAGE
-          digest=$DIGEST
-          tag=$TAG
-          source_commit=$GITHUB_SHA
-          built=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          workflow_run=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
-          EOF
-          sed -i 's/^          //' image.lock
-          cat image.lock
-          echo "### $IMAGE@$DIGEST (tag $TAG)" >> "$GITHUB_STEP_SUMMARY"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add image.lock
-          git commit -m "Pin image $TAG: box.sh pull now fetches $DIGEST" || exit 0
-          git pull --rebase origin main
-          git push origin HEAD:main
+          {
+            echo '# Merging this reviewed lock selects the image new computers will boot.'
+            echo "image=$IMAGE"
+            echo "digest=$DIGEST"
+            echo "tag=$TAG"
+            echo "source_commit=$GITHUB_SHA"
+            echo "built=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "workflow_run=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          } > image.lock
+      - name: Open a bot PR; never write directly to main
+        uses: peter-evans/create-pull-request@22a9089034f40e5a961c8808d113e2c98fb63676 # v7
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: bot/image-lock
+          add-paths: image.lock
+          commit-message: "Boot the verified computer image ${{ needs.publish.outputs.tag }}"
+          title: "Boot the verified computer image ${{ needs.publish.outputs.tag }}"
+          body: |
+            Both native architectures passed the image and desktop boot gates before any registry push.
+            The published multi-architecture index has a GitHub build-provenance attestation.
+            Review and merge this PR to select the digest; no moving tag is used by box.sh.
+          delete-branch: true
