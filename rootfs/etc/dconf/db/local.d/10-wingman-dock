@@ -1,0 +1,9 @@
+# Plank dock defaults: bottom, centered, these launchers in this order.
+[net/launchpad/plank/docks/dock1]
+dock-items=['chromium.dockitem', 'thunar.dockitem', 'xfce4-terminal.dockitem', 'libreoffice-writer.dockitem', 'libreoffice-calc.dockitem', 'libreoffice-impress.dockitem']
+position='bottom'
+alignment='center'
+icon-size=48
+hide-mode='window-dodge'
+theme='Transparent'
+lock-items=false

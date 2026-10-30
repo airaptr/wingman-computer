@@ -1,0 +1,7 @@
+# Wingman Computer: Chromium settings for every launch (sourced by /usr/bin/chromium).
+# The profile is ~/.config/chromium, which links to ~/chrome-profile.
+export CHROMIUM_FLAGS="$CHROMIUM_FLAGS --password-store=basic --no-first-run --no-default-browser-check --disable-dev-shm-usage"
+# Keep the sandbox when the kernel allows unprivileged user namespaces; drop it only when it does not.
+if ! unshare --user --map-root-user true 2>/dev/null; then
+    export CHROMIUM_FLAGS="$CHROMIUM_FLAGS --no-sandbox --test-type"
+fi

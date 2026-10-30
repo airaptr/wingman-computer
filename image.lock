@@ -1,0 +1,4 @@
+# The Wingman Computer image this repo pins. box.sh pull and start use this digest, never a moving tag.
+# The first CI build fills this in.
+image=ghcr.io/airaptr/wingman-computer
+digest=

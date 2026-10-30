@@ -1,0 +1,5 @@
+Copyright (c) 2026 Wildhaven Homes LLC
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+The image installs third-party software from Debian, Node.js, Astral (uv) and GitHub (gh);
+each keeps its own license, found under /usr/share/doc inside the image.
