@@ -139,11 +139,25 @@ jobs:
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
       - name: Attest the multi-architecture index
+        id: attest
+        continue-on-error: true
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ${{ env.IMAGE }}
           subject-digest: ${{ steps.index.outputs.digest }}
           push-to-registry: true
+          create-storage-record: false
+      - name: Wait before retrying a failed signing-service request
+        if: steps.attest.outcome == 'failure'
+        run: sleep 15
+      - name: Retry provenance publication; a second failure stops the release
+        if: steps.attest.outcome == 'failure'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.index.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
       - name: Verify the registry bundle and exact build source
         env:
           GH_TOKEN: ${{ github.token }}

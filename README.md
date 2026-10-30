@@ -168,6 +168,9 @@ write permissions. A weekly uncached rebuild refreshes Debian security packages.
 has repository/PR write permissions; it never commits directly to main. It also has Actions write
 permission solely to dispatch the bot branch's read-only checks: PRs created with `GITHUB_TOKEN`
 do not trigger `pull_request` workflows automatically. Branch-dispatched checks cannot publish.
+Provenance publication gets one delayed retry for transient signing-service failures; a second
+failure or an invalid registry bundle stops the lock update. Extra artifact-storage records are
+disabled, so publication does not need artifact-metadata write permission.
 
 The repository or organization must allow GitHub Actions to create pull requests. Container packages
 must be Public for anonymous downloads; repository access inheritance alone is not proof of this.
