@@ -1,4 +1,7 @@
-# The Wingman Computer image this repo pins. box.sh pull and start use this digest, never a moving tag.
-# The first CI build fills this in.
+# Merging this reviewed lock selects the image new computers will boot.
 image=ghcr.io/airaptr/wingman-computer
-digest=
+digest=sha256:fa28b0cc15ed0840e4dfb4d64452f3fbf9e05ec9ed5f8278151cbbe4fe96e258
+tag=2026.10.30
+source_commit=9db54bdaf1c2d296e18bf56ef598fa67cfab4853
+built=2026-10-30T06:40:25Z
+workflow_run=https://github.com/airaptr/wingman-computer/actions/runs/41015060384
